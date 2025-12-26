@@ -82,14 +82,37 @@ def load_json_snapshot(path: str) -> Dict[str, Any]:
 
 
 def extract_records(obj: Any) -> List[Dict[str, Any]]:
-    # 支援 {"records":[...]} / {"data":[...]} / 直接 list
-    if isinstance(obj, dict):
-        if isinstance(obj.get("records"), list):
-            return obj["records"]
-        if isinstance(obj.get("data"), list):
-            return obj["data"]
+    """
+    更強健的 records 萃取：
+    支援：
+    1) {"records":[...]}
+    2) {"data":[...]} / {"data":{"records":[...]}}
+    3) {"result":{"records":[...]}}
+    4) {"response":{"records":[...]}}
+    5) 直接就是 list
+    """
+    if obj is None:
+        return []
+
+    # 直接 list
     if isinstance(obj, list):
         return obj
+
+    if not isinstance(obj, dict):
+        return []
+
+    # 直接 records / data
+    if isinstance(obj.get("records"), list):
+        return obj["records"]
+    if isinstance(obj.get("data"), list):
+        return obj["data"]
+
+    # 常見巢狀：result/response/data 裡的 records
+    for k in ["result", "response", "data"]:
+        v = obj.get(k)
+        if isinstance(v, dict) and isinstance(v.get("records"), list):
+            return v["records"]
+
     return []
 
 
@@ -448,5 +471,6 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
