@@ -38,6 +38,7 @@ st.set_page_config(
 APP_TITLE = "臺中市空品微環境儀表板（A2 多點位）"
 DATA_JSON_PATH = os.path.join("data", "taichung_micro_latest.json")
 
+
 # -----------------------------
 # PM2.5 分級（依你畫面門檻）
 # -----------------------------
@@ -447,4 +448,5 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
