@@ -122,6 +122,12 @@ def normalize_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
         return df
 
     df.columns = [str(c).strip().lower() for c in df.columns]
+    
+        "coordinatelatitude": "lat",
+        "coordinatelongitude": "lon",
+        "hum": "humidity",
+        "town": "district",
+        "landmark": "name",
 
     rename_map = {
         "longitude": "lon",
@@ -472,6 +478,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
