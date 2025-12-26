@@ -1,596 +1,532 @@
+# dashboard.py
+# 臺中市空品微環境儀表板（A2 多點位）
+# 解法 A：雲端（Streamlit Cloud）只讀 data/taichung_micro_latest.json，不直接打 API（避免 SSL 憑證問題）
+# 本機可選擇性打 API（但預設也仍以 JSON 快照為主）
+
 import os
 import json
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
-import math
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-import pydeck as pdk
+
+# --- 可選：本機才需要 requests（雲端不會用到，requirements 有沒有也不影響主要功能） ---
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # noqa
+
+# -----------------------------
+# 基本設定
+# -----------------------------
+st.set_page_config(
+    page_title="臺中市空品微環境儀表板（A2 多點位）",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+APP_TITLE = "臺中市空品微環境儀表板（A2 多點位）"
+DATA_JSON_PATH = os.path.join("data", "taichung_micro_latest.json")
+
+# 你之前嘗試過的 API 候選（保留在 UI 顯示來源，但雲端不會真的連）
+DEFAULT_API_CANDIDATES = [
+    "https://datacenter.taichung.gov.tw/swagger/OpenData/33093aab-c094-4caf-9653-389ee511a618?limit=1000&offset=0",
+    "https://datacenter.taichung.gov.tw/OpenData/33093aab-c094-4caf-9653-389ee511a618?limit=1000&offset=0",
+    "https://datacenter.taichung.gov.tw/api/OpenData/33093aab-c094-4caf-9653-389ee511a618?limit=1000&offset=0",
+    "https://datacenter.taichung.gov.tw/openapi/OpenData/33093aab-c094-4caf-9653-389ee511a618?limit=1000&offset=0",
+]
+
+# -----------------------------
+# 工具：判斷環境
+# -----------------------------
+def is_streamlit_cloud() -> bool:
+    """
+    粗略判斷是否在 Streamlit Cloud。
+    - Streamlit Cloud 常見環境變數：STREAMLIT_SHARING / STREAMLIT_CLOUD 等（可能會變）
+    - 我們採「保守策略」：只要不是明確本機，就當作雲端，避免打 API。
+    """
+    for k in ["STREAMLIT_SHARING", "STREAMLIT_CLOUD", "STREAMLIT_RUNTIME_ENV"]:
+        if os.getenv(k):
+            return True
+    # GitHub Codespaces / Replit 等也當作雲端類環境，避免 SSL/網路不穩
+    if os.getenv("CODESPACES") or os.getenv("REPL_ID"):
+        return True
+    # 若使用者有顯示設定 LOCAL_RUN=1，才視為本機
+    if os.getenv("LOCAL_RUN") == "1":
+        return False
+    # 預設保守：視為雲端
+    return True
 
 
-# =========================
-# 0) 讀取 .env（與本檔同一層）
-# =========================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(APP_DIR, ".env")
-load_dotenv(ENV_PATH)
-
-API_URL = os.getenv("TAICHUNG_MICRO_API_URL", "").strip().strip('"').strip("'")
-API_KEY = os.getenv("TAICHUNG_MICRO_API_KEY", "").strip().strip('"').strip("'")
-
-TZ_TW = timezone(timedelta(hours=8))
-DATA_DIR = os.path.join(APP_DIR, "data")
-CACHE_FILE = os.path.join(DATA_DIR, "taichung_micro_latest.json")
-
-UUID = "33093aab-c094-4caf-9653-389ee511a618"
-DEFAULT_SWAGGER_URL = f"https://datacenter.taichung.gov.tw/swagger/OpenData/{UUID}"
-
-
-# =========================
-# 工具函式
-# =========================
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+# -----------------------------
+# 工具：PM2.5 分級（你畫面已在用的門檻）
+# -----------------------------
+def pm25_level(pm25: float) -> Tuple[str, str]:
+    """
+    回傳：等級文字、建議短語（給一般民眾可理解）
+    門檻沿用你畫面上的版本：
+    <=15.4 良好
+    15.5–35.4 普通
+    35.5–54.4 敏感族群留意
+    >=54.5 不健康
+    """
+    if pm25 <= 15.4:
+        return "良好", "可正常活動。"
+    if pm25 <= 35.4:
+        return "普通", "多數人可正常活動；敏感族群留意身體狀況。"
+    if pm25 <= 54.4:
+        return "敏感族群留意", "敏感族群建議減少戶外劇烈活動。"
+    return "不健康", "建議減少戶外活動；敏感族群避免外出。"
 
 
-def now_tw():
-    return datetime.now(TZ_TW)
+def pm25_color_tag(level: str) -> str:
+    # 文字標籤用（不強制顏色，避免不同環境渲染差異）
+    return {
+        "良好": "🟢",
+        "普通": "🟡",
+        "敏感族群留意": "🟠",
+        "不健康": "🔴",
+    }.get(level, "⚪")
 
 
-def safe_float(x):
-    try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s == "" or s.lower() in ("nan", "none", "null"):
-            return None
-        return float(s)
-    except Exception:
-        return None
+# -----------------------------
+# 工具：讀取 JSON
+# -----------------------------
+def load_json_snapshot(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def normalize_records(payload):
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in ["records", "data", "items", "result"]:
-            v = payload.get(k)
-            if isinstance(v, list):
-                return v
-            if isinstance(v, dict):
-                vv = v.get("records")
-                if isinstance(vv, list):
-                    return vv
+def extract_records(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    支援兩種常見格式：
+    1) {"records":[...]}
+    2) 直接就是 list / 或 {"data":[...]}
+    """
+    if isinstance(obj, dict):
+        if isinstance(obj.get("records"), list):
+            return obj["records"]
+        if isinstance(obj.get("data"), list):
+            return obj["data"]
+    if isinstance(obj, list):
+        return obj
     return []
 
 
-def with_query(url: str, add_params: dict):
-    u = urlparse(url)
-    q = parse_qs(u.query)
-    for k, v in add_params.items():
-        if k not in q:
-            q[k] = [str(v)]
-    new_query = urlencode({k: q[k][0] for k in q}, doseq=False)
-    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
-
-
-def candidate_urls(base_url: str):
-    base_url = base_url.strip()
-    cands = []
-    if base_url:
-        cands.append(with_query(base_url, {"limit": 1000, "offset": 0}))
-    cands.append(with_query(DEFAULT_SWAGGER_URL, {"limit": 1000, "offset": 0}))
-    cands.append(with_query(f"https://datacenter.taichung.gov.tw/OpenData/{UUID}", {"limit": 1000, "offset": 0}))
-    cands.append(with_query(f"https://datacenter.taichung.gov.tw/api/OpenData/{UUID}", {"limit": 1000, "offset": 0}))
-    cands.append(with_query(f"https://datacenter.taichung.gov.tw/api/v1/OpenData/{UUID}", {"limit": 1000, "offset": 0}))
-    cands.append(with_query(f"https://datacenter.taichung.gov.tw/openapi/OpenData/{UUID}", {"limit": 1000, "offset": 0}))
-
-    seen = set()
-    uniq = []
-    for u in cands:
-        if u not in seen:
-            uniq.append(u)
-            seen.add(u)
-    return uniq
-
-
-def fetch_json(url: str, api_key: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        "Connection": "close",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    if api_key:
-        headers["Authorization"] = api_key
-        headers["X-API-KEY"] = api_key
-
-    s = requests.Session()
-    r = s.get(url, headers=headers, timeout=35)
-    r.raise_for_status()
-
-    try:
-        payload = r.json()
-    except Exception:
-        payload = json.loads(r.text)
-    return payload
-
-
-@st.cache_data(ttl=60)
-def fetch_records_smart(base_url: str, api_key: str):
-    last_err = None
-    tried = []
-    for u in candidate_urls(base_url):
-        tried.append(u)
-        try:
-            payload = fetch_json(u, api_key)
-            records = normalize_records(payload)
-            if isinstance(payload, list) and len(payload) > 0:
-                return u, payload
-            if records and len(records) > 0:
-                return u, records
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise RuntimeError(
-        "所有候選 API 都抓不到資料。\n"
-        f"最後錯誤：{last_err}\n"
-        f"已嘗試：\n- " + "\n- ".join(tried)
-    )
-
-
-def build_df(records):
-    if not records:
-        return pd.DataFrame()
-
+def normalize_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    盡量容錯：不同資料集欄位名可能不同
+    你目前需要的核心欄位：
+    - 經度、緯度（lon/lat）
+    - PM2.5（pm25）
+    - 溫度/濕度（temp/humidity）可有可無
+    - 行政區（district）可有可無
+    - 點位名稱（name）可有可無
+    - 觀測時間（time）可有可無
+    """
     df = pd.DataFrame(records).copy()
 
-    candidates = {
-        "Device": ["Device", "device", "設備", "裝置"],
-        "Town": ["Town", "town", "district", "area", "行政區", "區", "鄉鎮市區"],
-        "Landmark": ["Landmark", "landmark", "name", "location", "地標", "站名", "地點"],
-        "Lat": ["CoordinateLatitude", "latitude", "lat", "CoordinateLat", "Coordinate_Latitude", "緯度"],
-        "Lon": ["Coordinatelongitude", "longitude", "lon", "lng", "CoordinateLon", "Coordinate_Longitude", "經度"],
-        "PM25": ["PM2.5", "pm2.5", "pm25", "PM25", "pm2_5", "PM2_5", "細懸浮微粒", "PM2_5_UGM3"],
-        "Temp": ["Temp", "temp", "temperature", "溫度", "TEMP"],
-        "Hum": ["Hum", "hum", "humidity", "濕度", "HUM"],
-        "Id": ["Id", "id"],
+    # 小寫化欄位，方便對齊
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # 欄位別名對齊
+    rename_map = {
+        "longitude": "lon",
+        "lng": "lon",
+        "long": "lon",
+        "經度": "lon",
+        "latitude": "lat",
+        "緯度": "lat",
+        "pm2_5": "pm25",
+        "pm25": "pm25",
+        "pm2.5": "pm25",
+        "pm2_5_avg": "pm25",
+        "temperature": "temp",
+        "temp_c": "temp",
+        "溫度": "temp",
+        "humidity": "humidity",
+        "rh": "humidity",
+        "濕度": "humidity",
+        "district": "district",
+        "行政區": "district",
+        "area": "district",
+        "sitename": "name",
+        "site_name": "name",
+        "點位": "name",
+        "name": "name",
+        "time": "time",
+        "timestamp": "time",
+        "datatime": "time",
+        "datetime": "time",
+        "測定時間": "time",
+        "publishtime": "time",
+        "publish_time": "time",
     }
+    for k, v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df = df.rename(columns={k: v})
 
-    rename = {}
-    for std, cands in candidates.items():
-        for c in cands:
-            if c in df.columns:
-                rename[c] = std
-                break
-    df = df.rename(columns=rename)
-
-    for c in ["Lat", "Lon", "PM25", "Temp", "Hum"]:
+    # 轉數字欄位
+    for c in ["lon", "lat", "pm25", "temp", "humidity"]:
         if c in df.columns:
-            df[c] = df[c].apply(safe_float)
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 清掉沒有經緯度的點
+    if "lon" in df.columns and "lat" in df.columns:
+        df = df.dropna(subset=["lon", "lat"])
+    else:
+        # 沒有經緯度就回傳空，避免地圖報錯
+        return pd.DataFrame()
+
+    # PM2.5 缺值就先 drop（地圖與排名都需要）
+    if "pm25" in df.columns:
+        df = df.dropna(subset=["pm25"])
+    else:
+        return pd.DataFrame()
+
+    # 加上分級
+    levels = df["pm25"].apply(lambda x: pm25_level(float(x))[0])
+    advices = df["pm25"].apply(lambda x: pm25_level(float(x))[1])
+    df["level"] = levels
+    df["advice"] = advices
+    df["level_tag"] = df["level"].apply(pm25_color_tag)
+
+    # 補足缺欄位
+    for c in ["name", "district", "temp", "humidity", "time"]:
+        if c not in df.columns:
+            df[c] = None
 
     return df
 
 
-def latest_per_device(df):
-    if df.empty:
-        return df
-    if "Device" not in df.columns:
-        return df
-    return df.drop_duplicates(subset=["Device"], keep="first")
+def infer_latest_time(df: pd.DataFrame) -> Optional[str]:
+    """
+    嘗試從 time 欄位推估最新時間，若資料本身不提供，回傳 None
+    """
+    if "time" not in df.columns:
+        return None
+    # time 可能是字串：嘗試 parse
+    s = df["time"].dropna().astype(str).str.strip()
+    if s.empty:
+        return None
+    # 嘗試多種格式
+    parsed = pd.to_datetime(s, errors="coerce", utc=False)
+    parsed = parsed.dropna()
+    if parsed.empty:
+        return None
+    # 取最大
+    t = parsed.max()
+    # 顯示為臺灣常用格式
+    return t.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def pm25_level(pm):
-    if pm is None:
-        return "無資料"
-    if pm <= 15.4: return "良好"
-    if pm <= 35.4: return "普通"
-    if pm <= 54.4: return "對敏感族群不健康"
-    if pm <= 150.4: return "不健康"
-    if pm <= 250.4: return "非常不健康"
-    return "危害"
+# -----------------------------
+# （本機可選）抓 API：雲端直接禁止
+# -----------------------------
+def try_fetch_api(urls: List[str], timeout: int = 20) -> Dict[str, Any]:
+    if requests is None:
+        raise RuntimeError("requests 未安裝，無法抓 API。請改用本機快照 JSON。")
+
+    last_err = None
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=timeout)
+            r.raise_for_status()
+            return {"ok": True, "url": u, "json": r.json()}
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"所有候選 API 都失敗，最後錯誤：{last_err}")
 
 
-def pm25_advice(level: str):
-    if level == "良好":
-        return "可正常活動。"
-    if level == "普通":
-        return "可正常活動；敏感族群留意。"
-    if level == "對敏感族群不健康":
-        return "敏感族群減少長時間戶外活動。"
-    if level == "不健康":
-        return "建議減少戶外活動，必要時戴口罩。"
-    if level == "非常不健康":
-        return "盡量避免外出；敏感族群建議留在室內。"
-    if level == "危害":
-        return "避免外出；若需外出請加強防護。"
-    return "暫無建議（資料不足）。"
+# -----------------------------
+# 版面：Sidebar
+# -----------------------------
+st.sidebar.markdown("## 顯示模式")
+mode = st.sidebar.radio(
+    "選擇畫面",
+    ["一般民眾（快速理解）", "專業人員（完整分析）"],
+    index=0,
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 連線設定")
+
+api_url_hint = st.sidebar.text_input(
+    "API URL（可留空）",
+    value="https://datacenter.taichung.gov.tw/…",
+    help="雲端展示版不直接連線 API（避免 SSL 問題），此欄位僅作為資料來源說明。",
+)
+
+api_key_masked = st.sidebar.text_input(
+    "API Key（如需，已隱藏）",
+    value="********",
+    type="password",
+    help="本專題雲端展示版不使用 API Key；若你本機需要，可在 .env 或 fetch_local.py 管理。",
+)
+
+colA, colB = st.sidebar.columns(2)
+btn_refresh = colA.button("立即更新", use_container_width=True)
+btn_clear = colB.button("清除快取", use_container_width=True)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 顯示選項（共用）")
+only_geo = st.sidebar.checkbox("只顯示有經緯度的點位", value=True)
+only_hot = st.sidebar.checkbox("只顯示超標點位（PM2.5 > 35.4）", value=False)
+show_trend = st.sidebar.checkbox("點位半徑隨 PM2.5 變化", value=True)
+
+topn = st.sidebar.slider("Top N（PM2.5）", min_value=10, max_value=100, value=50, step=5)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("🔒 雲端展示版採用資料快照（JSON），不即時連線政府 API，以確保穩定性與安全性。")
+
+# 清除快取
+if btn_clear:
+    st.cache_data.clear()
+    st.toast("已清除快取", icon="🧹")
 
 
-def sensitive_note(level: str):
-    if level in ("良好", "普通"):
-        return "敏感族群留意身體狀況"
-    if level in ("對敏感族群不健康", "不健康", "非常不健康", "危害"):
-        return "敏感族群建議減少戶外活動"
-    return "—"
-
-
-def pm25_color(pm):
-    if pm is None:
-        return [160, 160, 160, 160]
-    if pm <= 15.4:
-        return [0, 180, 90, 180]
-    if pm <= 35.4:
-        return [255, 210, 0, 180]
-    if pm <= 54.4:
-        return [255, 140, 0, 180]
-    if pm <= 150.4:
-        return [230, 0, 0, 180]
-    if pm <= 250.4:
-        return [150, 0, 200, 180]
-    return [120, 60, 0, 180]
-
-
-def pm25_radius(pm, base=60, max_r=260):
-    if pm is None:
-        return base
-    r = base + (pm ** 0.5) * 25
-    return min(max_r, max(base, r))
-
-
-def save_cache(records, used_url: str, fetch_time_str: str):
-    ensure_dir(DATA_DIR)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"saved_at_tw": fetch_time_str, "used_api": used_url, "count": len(records), "records": records},
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-
-def citizen_summary(df: pd.DataFrame, fetch_time_str: str):
-    if df.empty or "PM25" not in df.columns:
-        return {
-            "headline": f"目前尚無足夠資料可判讀（系統抓取時間：{fetch_time_str}）。",
-            "district": "未取得 PM2.5 欄位或資料為空，建議稍後再更新。",
-            "howto": "若畫面點位很多，建議先開啟「只顯示超標點位」。"
-        }
-
-    pm = df["PM25"].dropna()
-    if pm.empty:
-        return {
-            "headline": f"目前 PM2.5 暫無可用數值（系統抓取時間：{fetch_time_str}）。",
-            "district": "建議稍後再更新，或確認資料源是否正常。",
-            "howto": "可切換到「專業人員版」查看原始欄位是否完整。"
-        }
-
-    median = float(pm.median())
-    med_level = pm25_level(median)
-
-    if med_level in ("良好", "普通"):
-        headline = f"臺中市整體空品以「{med_level}」為主（PM2.5 中位數 {median:.1f}）。多數地區可正常活動。"
-    else:
-        headline = f"臺中市目前空品偏「{med_level}」（PM2.5 中位數 {median:.1f}）。建議敏感族群減少長時間戶外活動。"
-
-    district_text = ""
-    if "Town" in df.columns:
-        dd = df[df["Town"].notna() & (df["Town"].astype(str).str.strip() != "")].copy()
-        dd = dd[dd["PM25"].notna()]
-        if len(dd) > 0:
-            g = dd.groupby("Town")["PM25"]
-            summary = pd.DataFrame({"最大": g.max(), "平均": g.mean(), "點位數": g.count()}).sort_values(by="最大", ascending=False)
-            top3 = summary.head(3)
-            lines = [f"- {town}：最高 {row['最大']:.1f}（平均 {row['平均']:.1f}，點位 {int(row['點位數'])}）"
-                     for town, row in top3.iterrows()]
-            district_text = "需要留意的行政區（以區內最高 PM2.5 排序）：\n" + "\n".join(lines)
-        else:
-            district_text = "行政區資訊不足，暫以全市數值判讀。"
-    else:
-        district_text = "資料未提供行政區欄位，暫以全市數值判讀。"
-
-    howto = (
-        f"怎麼看這張圖：\n"
-        f"- 🟢 ≤15.4：良好　🟡 15.5–35.4：普通　🟠 35.5–54.4：敏感族群留意　🔴 ≥54.5：不健康\n"
-        f"- 圓點越大代表 PM2.5 越高。\n"
-        f"- 系統抓取時間：{fetch_time_str}（本資料集未提供觀測時間戳）"
-    )
-
-    return {"headline": headline, "district": district_text, "howto": howto}
-
-
-def district_table(df: pd.DataFrame):
-    if "Town" not in df.columns or "PM25" not in df.columns:
-        return pd.DataFrame()
-    dd = df.copy()
-    dd = dd[dd["Town"].notna() & (dd["Town"].astype(str).str.strip() != "")]
-    dd = dd[dd["PM25"].notna()]
-    if dd.empty:
-        return pd.DataFrame()
-    g = dd.groupby("Town")["PM25"]
-    tbl = pd.DataFrame({
-        "點位數": g.count(),
-        "平均 PM2.5": g.mean().round(1),
-        "最大 PM2.5": g.max().round(1),
-        "中位數 PM2.5": g.median().round(1),
-    }).sort_values(by="最大 PM2.5", ascending=False)
-    return tbl
-
-
-def district_stats_line(df: pd.DataFrame, town: str):
-    if df.empty or "PM25" not in df.columns:
-        return "此行政區目前沒有足夠資料可判讀。"
-    pm = df["PM25"].dropna()
-    if pm.empty:
-        return "此行政區目前沒有 PM2.5 可用數值。"
-    n = int(pm.count())
-    med = float(pm.median())
-    mx = float(pm.max())
-    lvl = pm25_level(med)
-    msg = f"{town}目前整體屬「{lvl}」（中位數 {med:.1f}）。{pm25_advice(lvl)}（點位數 {n}，最高 {mx:.1f}）"
-    return msg
-
-
-# =========================
-# ✅ 自動縮放：由點位 bounds 推估 zoom
-# =========================
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-def zoom_from_bounds(lat_min, lat_max, lon_min, lon_max, viewport_px=(1100, 650), padding=1.25):
-    lat_span = max(1e-6, lat_max - lat_min)
-    lon_span = max(1e-6, lon_max - lon_min)
-
-    def lat_to_mercator_y(lat):
-        lat = clamp(lat, -85.0, 85.0)
-        rad = math.radians(lat)
-        return math.log(math.tan(rad / 2.0 + math.pi / 4.0))
-
-    y_min = lat_to_mercator_y(lat_min)
-    y_max = lat_to_mercator_y(lat_max)
-    y_span = max(1e-6, y_max - y_min)
-
-    vp_w, vp_h = viewport_px
-    scale_x = (vp_w / 256.0) / lon_span
-    scale_y = (vp_h / 256.0) / y_span
-    scale = min(scale_x, scale_y) / padding
-
-    zoom = math.log(scale, 2)
-    return clamp(zoom, 8, 14)
-
-
-def view_state_for_points(df_map: pd.DataFrame, default_zoom=10):
-    m = df_map.dropna(subset=["Lat", "Lon"]).copy()
-    if m.empty:
-        return pdk.ViewState(latitude=24.15, longitude=120.67, zoom=default_zoom, pitch=0)
-
-    lat_min, lat_max = float(m["Lat"].min()), float(m["Lat"].max())
-    lon_min, lon_max = float(m["Lon"].min()), float(m["Lon"].max())
-
-    center_lat = (lat_min + lat_max) / 2.0
-    center_lon = (lon_min + lon_max) / 2.0
-
-    if (lat_max - lat_min) < 0.002 and (lon_max - lon_min) < 0.002:
-        z = 13
-    else:
-        z = zoom_from_bounds(lat_min, lat_max, lon_min, lon_max)
-
-    return pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=z, pitch=0)
-
-
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title="臺中市空品微環境儀表板（A2 多點位）", layout="wide")
-st.title("臺中市空品微環境儀表板（A2 多點位）")
-st.caption("資料來源：臺中市政府 OpenData（微型感測：PM2.5／溫度／濕度／經緯度）")
-
-with st.sidebar:
-    st.header("顯示模式")
-    mode = st.radio("選擇畫面", ["一般民眾（快速理解）", "專業人員（完整分析）"], index=0)
-
-    st.divider()
-    st.header("連線設定")
-    url = st.text_input("API URL（可留空）", value=API_URL)
-    api_key = st.text_input("API Key（如需，已隱藏）", value=API_KEY, type="password")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        btn_refresh = st.button("立即更新", use_container_width=True)
-    with c2:
-        btn_clear = st.button("清除快取", use_container_width=True)
-
-    if btn_clear:
-        st.cache_data.clear()
-        st.success("已清除快取（下次會重新抓）")
-
-    st.divider()
-    st.header("顯示選項（共用）")
-    only_geo = st.checkbox("只顯示有經緯度的點位", True)
-    show_only_exceed = st.checkbox("只顯示超標點位（PM2.5 > 35.4）", False)
-    radius_by_pm = st.checkbox("點位半徑隨 PM2.5 變化", True)
-    top_n = st.slider("Top N（PM2.5）", 10, 200, 50, 10)
-
-
-# =========================
-# 取資料 + 抓取時間
-# =========================
-fetch_time = now_tw()
-fetch_time_str = fetch_time.strftime("%Y-%m-%d %H:%M:%S")
-
-try:
-    if btn_refresh:
-        st.cache_data.clear()
-    used_url, records = fetch_records_smart(url, api_key)
-    save_cache(records, used_url, fetch_time_str)
-except Exception as e:
-    st.error(f"抓取資料失敗：{e}")
-    st.stop()
-
-df_raw = build_df(records)
-df = latest_per_device(df_raw)
-
-if df.empty:
-    st.warning("資料為空（欄位格式不符或回傳空集合）。")
-    st.stop()
-
-if only_geo and ("Lat" in df.columns) and ("Lon" in df.columns):
-    df = df[df["Lat"].notna() & df["Lon"].notna()]
-
-if show_only_exceed and "PM25" in df.columns:
-    df = df[df["PM25"].notna() & (df["PM25"] > 35.4)]
-
-dist_tbl = district_table(df)
-
-
-def render_map(df_map: pd.DataFrame, fit_zoom: bool = False):
-    if "Lat" not in df_map.columns or "Lon" not in df_map.columns:
-        st.warning("資料缺少經緯度，無法顯示地圖。")
-        return
-    if df_map[["Lat", "Lon"]].dropna().shape[0] == 0:
-        st.warning("目前沒有可用的經緯度點位可畫地圖。")
-        return
-
-    m = df_map.copy()
-    if "Town" not in m.columns:
-        m["Town"] = ""
-    if "Landmark" not in m.columns:
-        m["Landmark"] = ""
-    if "PM25" not in m.columns:
-        m["PM25"] = None
-    if "Temp" not in m.columns:
-        m["Temp"] = None
-    if "Hum" not in m.columns:
-        m["Hum"] = None
-
-    m["level"] = m["PM25"].apply(pm25_level)
-    m["advice"] = m["level"].apply(pm25_advice)
-    m["sensitive"] = m["level"].apply(sensitive_note)
-
-    m["color"] = m["PM25"].apply(pm25_color)
-    m["radius"] = m["PM25"].apply(lambda x: pm25_radius(x)) if radius_by_pm else 80
-
-    if fit_zoom:
-        view_state = view_state_for_points(m, default_zoom=10)
-    else:
-        view_state = pdk.ViewState(
-            latitude=float(m["Lat"].median()),
-            longitude=float(m["Lon"].median()),
-            zoom=10,
-            pitch=0,
-        )
-
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=m,
-        get_position=["Lon", "Lat"],
-        get_radius="radius",
-        get_fill_color="color",
-        pickable=True,
-        auto_highlight=True,
-    )
-
-    tooltip = {
-        "text": (
-            "{Town}｜{Landmark}\n"
-            "PM2.5：{PM25} μg/m³（{level}）\n"
-            "溫度：{Temp} °C｜濕度：{Hum} %\n"
-            "建議：{advice}\n"
-            "敏感族群：{sensitive}\n"
-            "— 分級門檻 —\n"
-            "≤15.4 良好｜15.5–35.4 普通｜35.5–54.4 敏感族群｜≥54.5 不健康"
-        )
+# -----------------------------
+# 讀取資料（核心）
+# -----------------------------
+@st.cache_data(ttl=60)
+def load_data() -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    讀取資料策略（最穩）：
+    1) 若 data/taichung_micro_latest.json 存在 → 直接讀（本機/雲端都能跑）
+    2) 若不存在：
+       - 雲端：直接提示「請先推送 JSON」
+       - 本機：可選擇嘗試打 API（仍不建議，因 SSL 常不穩）
+    """
+    meta: Dict[str, Any] = {
+        "source": "臺中市政府 OpenData（微型感測）",
+        "snapshot_path": DATA_JSON_PATH,
+        "used": None,
+        "used_url": None,
+        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    deck = pdk.Deck(
-        map_style=None,
-        initial_view_state=view_state,
-        layers=[layer],
-        tooltip=tooltip,
+    if os.path.exists(DATA_JSON_PATH):
+        obj = load_json_snapshot(DATA_JSON_PATH)
+        recs = extract_records(obj)
+        df = normalize_df(recs)
+        meta["used"] = "snapshot_json"
+        return df, meta
+
+    # JSON 不存在 → 分流
+    if is_streamlit_cloud():
+        meta["used"] = "cloud_no_snapshot"
+        return pd.DataFrame(), meta
+
+    # 本機才允許嘗試 API（但你可視需求關掉）
+    # 若你不希望本機也打 API，可直接回傳空 df
+    # 這裡預設：本機會嘗試一次
+    result = try_fetch_api(DEFAULT_API_CANDIDATES)
+    obj = result["json"]
+    recs = extract_records(obj)
+    df = normalize_df(recs)
+    meta["used"] = "api_local"
+    meta["used_url"] = result["url"]
+    return df, meta
+
+
+df, meta = load_data()
+
+# -----------------------------
+# Header
+# -----------------------------
+st.title(APP_TITLE)
+st.caption("資料來源：臺中市政府 OpenData（微型感測：PM2.5／溫度／濕度／經緯度）")
+
+# 使用方式提示
+st.success(
+    "使用方式：先看「快速判讀」抓重點 → 再看地圖定位；可用下拉選擇行政區聚焦查看；若只想看需注意地點，勾選左側「只顯示超標點位」。",
+    icon="✅",
+)
+
+# -----------------------------
+# 若雲端沒 snapshot，給明確提示（不打 API，不報 SSL）
+# -----------------------------
+if df.empty:
+    st.error(
+        "目前找不到資料快照（data/taichung_micro_latest.json）。\n\n"
+        "✅ 解法 A（建議）：請在本機執行 `python fetch_local.py` 產生最新 JSON，然後 push 到 GitHub。\n"
+        "雲端展示版將自動讀取該 JSON，不直接連線 API（避免 SSL 憑證問題）。",
+        icon="🚫",
     )
-    st.pydeck_chart(deck, use_container_width=True)
+    st.stop()
 
 
-# =========================
-# 版面：一般民眾 vs 專業人員
-# =========================
-if mode == "一般民眾（快速理解）":
-    st.success("使用方式：先看「快速判讀」抓重點 → 再看地圖定位；可用下拉選擇行政區聚焦查看；若只想看需注意地點，勾選左側「只顯示超標點位」。")
+# -----------------------------
+# 篩選
+# -----------------------------
+if only_geo:
+    df = df.dropna(subset=["lon", "lat"])
 
-    summary = citizen_summary(df, fetch_time_str)
+if only_hot:
+    df = df[df["pm25"] > 35.4]
 
-    st.subheader("快速判讀")
-    st.info(summary["headline"])
+# 行政區下拉（含「全市」）
+districts = ["全市"] + sorted([d for d in df["district"].dropna().unique().tolist() if str(d).strip() != ""])
+st.markdown("### 選擇行政區（聚焦查看）")
+sel_dist = st.selectbox("行政區", districts, index=0, label_visibility="collapsed")
 
-    left, right = st.columns([1.1, 0.9])
-    with left:
-        st.markdown("### 你需要留意什麼？")
-        st.markdown(summary["district"])
-    with right:
-        st.markdown("### 看圖小抄")
-        st.markdown(summary["howto"])
-
-    st.divider()
-
-    st.subheader("選擇行政區（聚焦查看）")
-    fit_zoom = False
-
-    if "Town" in df.columns:
-        town_list = sorted([t for t in df["Town"].dropna().astype(str).unique() if t.strip() != ""])
-        options = ["全市"] + town_list
-        selected = st.selectbox("行政區", options, index=0)
-
-        if selected != "全市":
-            df_focus = df[df["Town"].astype(str) == selected].copy()
-            if df_focus.empty:
-                st.warning(f"{selected} 目前沒有可用點位資料。")
-                df_focus = df.copy()
-            else:
-                st.info(district_stats_line(df_focus, selected))
-                fit_zoom = True
-        else:
-            df_focus = df.copy()
-            st.caption("目前顯示：全市點位")
-    else:
-        df_focus = df.copy()
-        st.warning("資料未提供行政區（Town）欄位，暫無法使用下拉聚焦。")
-
-    st.divider()
-
-    st.subheader("地圖（依 PM2.5 分級上色）")
-    render_map(df_focus, fit_zoom=fit_zoom)
-    st.caption("提示：滑鼠移到點位上，可直接看到 PM2.5、分級、溫濕度、建議、敏感族群提醒與分級門檻。")
-
-    st.divider()
-    with st.expander("行政區摘要（平均 / 最大 / 中位數 PM2.5）", expanded=False):
-        if dist_tbl.empty:
-            st.info("目前資料缺少行政區（Town）或 PM2.5 欄位，暫無法產生行政區摘要。")
-        else:
-            st.dataframe(dist_tbl, use_container_width=True)
-
-    st.divider()
-    with st.expander("完整資料表（進階：可排序、可查詢）", expanded=False):
-        st.dataframe(df_focus, use_container_width=True, hide_index=True)
-        st.caption(f"系統抓取時間：{fetch_time_str}｜資料落地：{CACHE_FILE}")
-
-    with st.expander("技術資訊（可選）", expanded=False):
-        st.write("✅ 本次實際使用的 API：")
-        st.code(used_url)
-        st.write("✅ 資料落地：")
-        st.code(CACHE_FILE)
-        st.caption("註：本資料集未提供觀測時間戳；本頁以『系統抓取時間』作為更新基準顯示。")
-
+if sel_dist != "全市":
+    df_view = df[df["district"] == sel_dist].copy()
 else:
-    st.subheader("地圖（點位分佈：依 PM2.5 分級上色）")
-    render_map(df, fit_zoom=False)
-    st.caption("提示：滑鼠移到點位上，可直接看到 PM2.5、分級、溫濕度、建議、敏感族群提醒與分級門檻。")
+    df_view = df.copy()
+
+# -----------------------------
+# 指標區：快訊 / 分級
+# -----------------------------
+pm25_median = float(df_view["pm25"].median()) if not df_view.empty else 0.0
+level_txt, advice_txt = pm25_level(pm25_median)
+
+# 最新時間（資料內有 time 就用；否則顯示「以抓取時間為準」）
+latest_time = infer_latest_time(df_view)
+if latest_time is None:
+    latest_time_display = f"{meta['fetched_at']}（本資料集未提供觀測時間欄位）"
+else:
+    latest_time_display = latest_time
+
+# 四個 KPI
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("點位數（每裝置取最新一筆）", f"{len(df_view):,}")
+k2.metric("PM2.5 中位數", f"{pm25_median:.1f}", f"{pm25_color_tag(level_txt)} {level_txt}")
+k3.metric("PM2.5 最大值", f"{float(df_view['pm25'].max()):.1f}")
+k4.metric("資料時間（最新）", latest_time_display)
+
+# 快速判讀
+st.markdown("## 快速判讀")
+st.info(f"臺中市整體空品以「{level_txt}」為主（PM2.5 中位數 {pm25_median:.1f}）。{advice_txt}", icon="🧭")
+
+# 提醒區：你需要留意什麼？
+st.markdown("## 你需要留意什麼？")
+# 以行政區內「最高 PM2.5」排序（取 Top 3）
+tmp = df.copy()
+tmp["district"] = tmp["district"].fillna("（未提供行政區）")
+grp = tmp.groupby("district", dropna=False).agg(
+    max_pm25=("pm25", "max"),
+    avg_pm25=("pm25", "mean"),
+    cnt=("pm25", "count"),
+).reset_index().sort_values("max_pm25", ascending=False)
+
+top3 = grp.head(3)
+lines = []
+for _, r in top3.iterrows():
+    lvl, adv = pm25_level(float(r["max_pm25"]))
+    lines.append(
+        f"- **{r['district']}**：最高 {r['max_pm25']:.1f}（平均 {r['avg_pm25']:.1f}，點位 {int(r['cnt'])}）"
+        f"　{pm25_color_tag(lvl)} {lvl}｜{adv}"
+    )
+st.markdown("\n".join(lines))
+
+# 看圖小抄：分級門檻與敏感族群提醒（你要求的短語）
+st.markdown("## 看圖小抄")
+st.markdown(
+    "- 🟢 ≤15.4：良好　　- 🟡 15.5–35.4：普通　　- 🟠 35.5–54.4：敏感族群留意　　- 🔴 ≥54.5：不健康\n"
+    "- 圓點越大代表 PM2.5 越高。\n"
+    "- **敏感族群提醒**：如有不適，請減少戶外活動並留意身體狀況。\n"
+    f"- 系統抓取時間：**{meta['fetched_at']}**（雲端展示版採用資料快照）"
+)
+
+# -----------------------------
+# 地圖（點位分佈）
+# -----------------------------
+st.markdown("## 地圖（點位分佈：依 PM2.5 分級上色）")
+
+# tooltip（更完整：溫度/濕度/分級建議）
+def build_tooltip(row: pd.Series) -> str:
+    name = row.get("name") if pd.notna(row.get("name")) else "（未命名點位）"
+    dist = row.get("district") if pd.notna(row.get("district")) else "（未提供行政區）"
+    pm = float(row.get("pm25", 0.0))
+    lvl = row.get("level", "")
+    adv = row.get("advice", "")
+    t = row.get("temp")
+    h = row.get("humidity")
+    t_txt = f"{float(t):.1f}°C" if pd.notna(t) else "未提供"
+    h_txt = f"{float(h):.0f}%" if pd.notna(h) else "未提供"
+    return (
+        f"{name}\n"
+        f"行政區：{dist}\n"
+        f"PM2.5：{pm:.1f}（{lvl}）\n"
+        f"溫度：{t_txt}｜濕度：{h_txt}\n"
+        f"建議：{adv}"
+    )
+
+df_map = df_view.copy()
+df_map["tooltip"] = df_map.apply(build_tooltip, axis=1)
+
+# 點位半徑：可隨 PM2.5 變化（你要求的自動縮放感）
+if show_trend:
+    # 基礎半徑 + 依 pm25 拉伸（限制最大值避免爆表）
+    df_map["radius"] = (df_map["pm25"].clip(lower=0, upper=200) / 2.5 + 40).clip(lower=40, upper=180)
+else:
+    df_map["radius"] = 60
+
+# 顏色分級：用 level_tag 區分（streamlit map 只能用 color 需搭配 st.pydeck）
+import pydeck as pdk  # 放這裡避免你 requirements 缺 pydeck 時太早爆
+
+# 顏色映射（RGBA）
+COLOR_MAP = {
+    "良好": [0, 200, 120, 180],
+    "普通": [240, 200, 0, 180],
+    "敏感族群留意": [255, 140, 0, 180],
+    "不健康": [230, 60, 60, 180],
+}
+
+def color_of(level: str) -> List[int]:
+    return COLOR_MAP.get(level, [120, 120, 120, 160])
+
+df_map["color"] = df_map["level"].apply(color_of)
+
+# 自動縮放：用點位的平均值作為中心
+center_lat = float(df_map["lat"].mean())
+center_lon = float(df_map["lon"].mean())
+
+layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=df_map,
+    get_position="[lon, lat]",
+    get_fill_color="color",
+    get_radius="radius",
+    pickable=True,
+    auto_highlight=True,
+)
+
+view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=11, pitch=0)
+
+deck = pdk.Deck(
+    layers=[layer],
+    initial_view_state=view_state,
+    tooltip={"text": "{tooltip}"},
+)
+
+st.pydeck_chart(deck, use_container_width=True)
+
+# -----------------------------
+# 表格區：Top N 高點位 + 全表
+# -----------------------------
+st.markdown(f"## PM2.5 前 {topn} 高點位")
+df_top = df_view.sort_values("pm25", ascending=False).head(topn).copy()
+show_cols = ["level_tag", "name", "district", "pm25", "temp", "humidity", "level", "advice", "time", "lon", "lat"]
+show_cols = [c for c in show_cols if c in df_top.columns]
+st.dataframe(df_top[show_cols], use_container_width=True, height=380)
+
+# 專業模式：顯示更多統計摘要
+if mode.startswith("專業"):
+    st.markdown("## 專業摘要（統計）")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("PM2.5 平均", f"{float(df_view['pm25'].mean()):.1f}")
+    c2.metric("PM2.5 75 分位數", f"{float(df_view['pm25'].quantile(0.75)):.1f}")
+    c3.metric("超標點位數（>35.4）", f"{int((df_view['pm25'] > 35.4).sum()):,}")
+
+    st.markdown("### 行政區分佈（依最高 PM2.5 排序）")
+    st.dataframe(grp.head(20), use_container_width=True)
+
+# 來源資訊
+st.markdown("---")
+st.caption(
+    f"資料來源：{meta['source']}｜讀取方式：{meta['used']}｜快照路徑：{meta['snapshot_path']}"
+)
