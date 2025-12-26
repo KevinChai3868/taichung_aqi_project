@@ -303,9 +303,10 @@ st.success(
 # 若沒有 JSON，給明確提示（不報 SSL，不打 API）
 if df.empty:
     st.error(
-        "目前找不到資料快照：`data/taichung_micro_latest.json`。\n\n"
-        "✅ 解法 A（建議）：請在本機執行 `python fetch_local.py` 產生最新 JSON，然後 push 到 GitHub。\n"
-        "雲端展示版會自動讀取該 JSON，不直接連線 API（避免 SSL 憑證問題）。",
+        f"已讀到 JSON 檔，但資料解析後為空（df.empty=True）。\n\n"
+        f"✅ 檔案存在：{DATA_JSON_PATH}\n"
+        f"❗ 代表問題不是「沒檔案」，而是「JSON 內容欄位無法對應」\n\n"
+        f"請確認 JSON 內是否包含：經度、緯度、PM2.5（名稱可能不同）。",
         icon="🚫",
     )
     st.stop()
@@ -471,6 +472,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
