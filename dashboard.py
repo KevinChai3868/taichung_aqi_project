@@ -123,43 +123,30 @@ def normalize_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
 
     df.columns = [str(c).strip().lower() for c in df.columns]
     
-        "coordinatelatitude": "lat",
-        "coordinatelongitude": "lon",
-        "hum": "humidity",
-        "town": "district",
-        "landmark": "name",
-
+       
     rename_map = {
-        "longitude": "lon",
-        "lng": "lon",
-        "long": "lon",
-        "經度": "lon",
-        "latitude": "lat",
-        "緯度": "lat",
-        "pm2_5": "pm25",
-        "pm2.5": "pm25",
-        "pm25": "pm25",
-        "pm2_5_avg": "pm25",
-        "temperature": "temp",
-        "temp_c": "temp",
-        "溫度": "temp",
-        "humidity": "humidity",
-        "rh": "humidity",
-        "濕度": "humidity",
-        "district": "district",
-        "行政區": "district",
-        "area": "district",
-        "sitename": "name",
-        "site_name": "name",
-        "點位": "name",
-        "name": "name",
-        "time": "time",
-        "timestamp": "time",
-        "datatime": "time",
-        "datetime": "time",
-        "測定時間": "time",
-        "publishtime": "time",
-        "publish_time": "time",
+    "longitude": "lon",
+    "lng": "lon",
+    "long": "lon",
+    "經度": "lon",
+
+    "latitude": "lat",
+    "緯度": "lat",
+
+    "coordinatelatitude": "lat",
+    "coordinatelongitude": "lon",
+
+    "pm2.5": "pm25",
+    "pm25": "pm25",
+
+    "temp": "temp",
+    "temperature": "temp",
+
+    "hum": "humidity",
+    "humidity": "humidity",
+
+    "town": "district",
+    "landmark": "name",
     }
 
     for k, v in rename_map.items():
@@ -478,6 +465,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
