@@ -1,6 +1,21 @@
 # dashboard.py
 # 臺中市空品微環境儀表板（A2 多點位）
 # 解法 A（固定）：雲端只讀 data/taichung_micro_latest.json，不直接連線 API（避免 SSL 憑證問題）
+# ===== DEBUG: Cloud 檔案盤點（暫時用，確認完就刪）=====
+import os
+import streamlit as st
+
+st.write("DEBUG cwd =", os.getcwd())
+st.write("DEBUG root files =", os.listdir("."))
+
+if os.path.exists("data"):
+    st.write("DEBUG data/ files =", os.listdir("data"))
+else:
+    st.write("DEBUG data/ folder NOT found")
+
+st.write("DEBUG exists data/taichung_micro_latest.json =",
+         os.path.exists(os.path.join("data", "taichung_micro_latest.json")))
+# =====================================================
 
 import os
 import json
@@ -432,3 +447,4 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
