@@ -176,10 +176,18 @@ def infer_latest_time_from_timecol(df: pd.DataFrame) -> Optional[str]:
     return parsed.max().strftime("%Y-%m-%d %H:%M:%S")
 
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 def file_mtime_str(path: str) -> Optional[str]:
+    """
+    Streamlit Cloud 通常以 UTC 顯示時間，這裡強制轉成臺灣時間（Asia/Taipei）
+    """
     try:
-        ts = os.path.getmtime(path)
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        ts = os.path.getmtime(path)  # epoch seconds
+        dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        dt_tw = dt_utc.astimezone(ZoneInfo("Asia/Taipei"))
+        return dt_tw.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
@@ -450,6 +458,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
