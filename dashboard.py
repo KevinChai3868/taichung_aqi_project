@@ -239,6 +239,14 @@ mode = st.sidebar.radio(
     ["一般民眾（快速理解）", "專業人員（完整分析）"],
     index=0,
 )
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 地圖底色")
+
+map_theme = st.sidebar.radio(
+    "選擇地圖底色",
+    ["黑色（Dark）", "白色（Light）"],
+    index=0,
+)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("## 連線設定（展示用）")
@@ -461,8 +469,14 @@ layer = pdk.Layer(
 # 簡化策略：全市預設 11，特定行政區略放大
 zoom = 11 if sel_dist == "全市" else 12
 
+if map_theme.startswith("黑色"):
+    map_style = "mapbox://styles/mapbox/dark-v10"
+else:
+    map_style = "mapbox://styles/mapbox/light-v10"
+
 deck = pdk.Deck(
     layers=[layer],
+    map_style=map_style,
     initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, pitch=0),
     tooltip={"text": "{tooltip}"},
 )
@@ -496,6 +510,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
