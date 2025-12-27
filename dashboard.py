@@ -470,9 +470,9 @@ layer = pdk.Layer(
 zoom = 11 if sel_dist == "全市" else 12
 
 if map_theme.startswith("黑色"):
-    map_style = "mapbox://styles/mapbox/dark-v10"
+    map_style = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
 else:
-    map_style = "mapbox://styles/mapbox/light-v10"
+    map_style = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 deck = pdk.Deck(
     layers=[layer],
@@ -510,6 +510,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
