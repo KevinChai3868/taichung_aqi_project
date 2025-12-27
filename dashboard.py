@@ -164,6 +164,44 @@ def normalize_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def infer_latest_time_from_timecol(df: pd.DataFrame) -> Optional[str]:
+    """
+    支援 time 欄位格式：
+    - 2025/12/27 上午 09:09:05
+    - 2025/12/27 下午 09:09:05
+    - 2025-12-27 09:09:05
+    - 2025/12/27 09:09:05
+    若解析成功，回傳最新時間字串（YYYY-MM-DD HH:MM:SS）
+    """
+    if "time" not in df.columns:
+        return None
+
+    s = df["time"].dropna().astype(str).str.strip()
+    if s.empty:
+        return None
+
+    # 1) 先把「上午/下午」轉成 AM/PM，讓 pandas 容易解析
+    #    例：2025/12/27 上午 09:09:05 -> 2025/12/27 AM 09:09:05
+    #        2025/12/27 下午 09:09:05 -> 2025/12/27 PM 09:09:05
+    s2 = (
+        s.str.replace("上午", "AM", regex=False)
+         .str.replace("下午", "PM", regex=False)
+         .str.replace("  ", " ", regex=False)
+    )
+
+    # 2) 先用明確格式嘗試（最穩）
+    parsed = pd.to_datetime(s2, format="%Y/%m/%d %p %I:%M:%S", errors="coerce")
+
+    # 3) 若還有沒成功的，再用較寬鬆解析補救
+    if parsed.isna().any():
+        parsed2 = pd.to_datetime(s2[parsed.isna()], errors="coerce")
+        parsed.loc[parsed.isna()] = parsed2
+
+    parsed = parsed.dropna()
+    if parsed.empty:
+        return None
+
+    return parsed.max().strftime("%Y-%m-%d %H:%M:%S")
+    
     if "time" not in df.columns:
         return None
     s = df["time"].dropna().astype(str).str.strip()
@@ -458,6 +496,7 @@ st.markdown("---")
 st.caption(
     f"資料來源：{meta.get('source')}｜讀取方式：{meta.get('used')}｜快照：{meta.get('snapshot_path')}｜載入時間：{meta.get('loaded_at')}"
 )
+
 
 
 
